@@ -1,0 +1,266 @@
+esphome:
+  name: "badkamer-heater"
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
+# ---- Wi-Fi Settings ----
+wifi:
+  ssid: "ssid"
+  password: "Pass"
+
+  # Disable Wi-Fi power saving (keeps OTA & API stable)
+  power_save_mode: none
+        
+  # Fallback hotspot (for setup)
+  ap:
+    ssid: "Basic-ESP32 Fallback"
+    password: "12345678"
+
+# ---- Logging ----
+logger:
+
+# ---- OTA Updates ----
+ota:
+  platform: esphome
+
+# ---- API (Home Assistant connection) ----
+api:
+  reboot_timeout: 10min
+
+# ---- Web server (optional) ----
+web_server:
+  port: 80
+  local: true            # Only accessible inside your LAN
+
+globals:
+  - id: target_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: offcounter
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  #max run time is 1 hour before auto shut down
+  - id: runcounter
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: lvl1_reached
+    type: bool
+    restore_value: no
+    initial_value: '0' 
+
+  - id: lvl2_reached
+    type: bool
+    restore_value: no
+    initial_value: '0' 
+
+# Example configuration entry
+one_wire:
+  - platform: gpio
+    pin: GPIO18
+
+# Example configuration entry
+sensor:
+  - platform: dallas_temp
+    address: 0xbe000000b26e0728
+    name: temperature
+    id: temp_sensor
+    update_interval: 5s
+    
+  - platform: wifi_signal
+    name: "WiFi Signal Sensor"
+    update_interval: 60s
+
+  - platform: template
+    name: "Runtime (minutes)"
+    id: runtime_minutes
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 2
+    lambda: |-
+      // Convert counts (0.5s each) to minutes
+      return (id(runcounter) * 0.5f) / 60.0f;
+    unit_of_measurement: "min"
+    update_interval: 5s
+# -----------------
+# Home Assistant Dropdown
+# -----------------
+select:
+  - platform: template
+    name: "Heater Mode"
+    id: heater_mode
+    options:
+      - "Off"
+      - "Cool"
+      - "On"
+      - "Boost"
+      - "Auto"
+    lambda: |-
+      switch (id(target_mode)) {
+        case 0: return std::string("Off");
+        case 1: return std::string("Cool");
+        case 2: return std::string("On");
+        case 3: return std::string("Boost");
+        case 4: return std::string("Auto");
+        default: return std::string("Off");
+      }
+    set_action:
+      - lambda: |-
+          if (x == "Off") id(target_mode) = 0;
+          else if (x == "Cool") id(target_mode) = 1;
+          else if (x == "On") id(target_mode) = 2;
+          else if (x == "Boost") id(target_mode) = 3;
+          else if (x == "Auto") id(target_mode) = 4;
+      - component.update: heater_mode
+      - logger.log: "Heater mode changed"
+
+
+# -----------------
+# Inverted GPIO Toggles
+# -----------------
+switch:
+  - platform: gpio
+    pin:
+      number: GPIO0
+      inverted: true
+    id: gpio0_toggle
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: gpio
+    pin:
+      number: GPIO1
+      inverted: true
+    id: gpio1_toggle
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: gpio
+    pin:
+      number: GPIO2
+      inverted: true
+    id: gpio2_toggle
+    restore_mode: RESTORE_DEFAULT_OFF
+
+binary_sensor:
+  - platform: template
+    name: "Fan"
+    lambda: |-
+      return id(gpio0_toggle).state;
+    icon: "mdi:fan"
+
+  - platform: template
+    name: "Heater 1"
+    lambda: |-
+      return id(gpio1_toggle).state;
+    icon: "mdi:radiator"
+
+  - platform: template
+    name: "Heater 2"
+    lambda: |-
+      return id(gpio2_toggle).state;
+    icon: "mdi:radiator"
+
+button:
+  - platform: restart
+    name: "heater Restart"
+
+# -----------------
+# Interval Task (500ms)
+# -----------------
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(target_mode) != 0){
+                id(offcounter) = 0;
+              }
+
+          //turn heater off after 1 hour
+          if (id(runcounter) > 7200){
+                id(target_mode) = 0;
+          }
+
+          switch (id(target_mode)) {
+            case 0:
+              id(runcounter) = 0;
+              id(offcounter) = id(offcounter) + 1;
+              // Off mode actions
+              if (id(offcounter) > 60){
+                id(gpio0_toggle).turn_off();
+              } else {
+                id(gpio0_toggle).turn_on();
+              }
+              id(gpio1_toggle).turn_off();
+              id(gpio2_toggle).turn_off();
+              break;
+
+            case 1:
+              id(runcounter) = 0;
+              // Cool mode actions
+              id(gpio0_toggle).turn_on();
+              id(gpio1_toggle).turn_off();
+              id(gpio2_toggle).turn_off();
+              break;
+
+            case 2:
+              id(runcounter) = id(runcounter) + 1;
+              // On mode actions
+              id(gpio0_toggle).turn_on();
+              id(gpio1_toggle).turn_on();
+              id(gpio2_toggle).turn_off();
+              break;
+
+            case 3:
+              id(runcounter) = id(runcounter) + 1;
+              // Boost mode actions
+              id(gpio0_toggle).turn_on();
+              id(gpio1_toggle).turn_on();
+              id(gpio2_toggle).turn_on();
+              break;
+
+            case 4:
+              id(runcounter) = id(runcounter) + 1;
+              // Reset levels if temperature drops far enough
+              if (id(temp_sensor).state < 24 - 2) {  // 2°C below level1 threshold
+                id(lvl1_reached) = 0;
+              }
+              if (id(temp_sensor).state < 24 - 4) {  // 4°C below level2 threshold
+                id(lvl2_reached) = 0;
+              }
+
+              // Always turn on GPIO0 in this mode
+              id(gpio0_toggle).turn_on();
+
+              // Level 1 control
+              if (id(temp_sensor).state < 22 && !id(lvl1_reached)) {
+                id(gpio1_toggle).turn_on();
+                id(lvl1_reached) = 1;
+              } else if (id(temp_sensor).state >= 24) {
+                id(gpio1_toggle).turn_off();
+              }
+
+              // Level 2 control
+              if (id(temp_sensor).state < 20 && !id(lvl2_reached)) {
+                id(gpio2_toggle).turn_on();
+                id(lvl2_reached) = 1;
+              } else if (id(temp_sensor).state >= 21) {
+                id(gpio2_toggle).turn_off();
+              }
+
+
+              break;
+
+            default:
+              // Fallback (Off)
+              id(gpio0_toggle).turn_off();
+              id(gpio1_toggle).turn_off();
+              id(gpio2_toggle).turn_off();
+              break;
+          }
